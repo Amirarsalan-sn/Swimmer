@@ -37,6 +37,55 @@ class SquareActivation(nn.Module):
         return x.pow(2)
 
 
+class ReplayMemory:
+    def __init__(self, capacity):
+        """
+        Experience Replay Memory defined by deques to store transitions/agent experiences
+        """
+
+        self.capacity = capacity
+
+        self.states = deque(maxlen=capacity)
+        self.next_states = deque(maxlen=capacity)
+        self.rewards = deque(maxlen=capacity)
+        self.dones = deque(maxlen=capacity)
+
+    def store(self, state, next_state, reward, done):
+        """
+        Append (store) the transitions to their respective deques
+        """
+
+        self.states.append(state)
+        self.next_states.append(next_state)
+        self.rewards.append(reward)
+        self.dones.append(done)
+
+    def sample(self, batch_size):
+        """
+        Randomly sample transitions from memory, then convert sampled transitions
+        to tensors and move to device (CPU or GPU).
+        """
+
+        indices = np.random.choice(len(self), size=batch_size, replace=False)
+
+        states = torch.stack([torch.as_tensor(self.states[i], dtype=torch.float32, device=device) for i in indices]).to(
+            device)
+        next_states = torch.stack(
+            [torch.as_tensor(self.next_states[i], dtype=torch.float32, device=device) for i in indices]).to(device)
+        rewards = torch.as_tensor([self.rewards[i] for i in indices], dtype=torch.float32, device=device)
+        dones = torch.as_tensor([self.dones[i] for i in indices], dtype=torch.bool, device=device)
+
+        return states, next_states, rewards, dones
+
+    def __len__(self):
+        """
+        To check how many samples are stored in the memory. self.dones deque
+        represents the length of the entire memory.
+        """
+
+        return len(self.dones)
+
+
 class PPOMemory:
     def __init__(self):
         self.states = deque()
@@ -160,10 +209,14 @@ class ValueNet(nn.Module):
 
 class PPOClip:
     def __init__(self, epsilon, discount_factor, lambda_r, epochs, entropy_coef, initial_std, std_coef, std_min,
-                 actor_lr, critic_lr, num_actions,
-                 input_dim):
+                 actor_lr, critic_lr, num_actions, input_dim, replay_capacity, batch_size, clip_gradient_norm):
         self.epsilon = epsilon
-        self.loss_history = []
+        self.policy_loss_history = []
+        self.policy_running_loss = 0
+        self.policy_learned_count = 0
+        self.value_loss_history = []
+        self.value_running_loss = 0
+        self.value_learned_count = 0
         self.initial_std = initial_std
         self.std_coef = std_coef
         self.std_min = std_min
@@ -175,6 +228,9 @@ class PPOClip:
         self.critic_lr = critic_lr
         self.num_actions = num_actions
         self.input_dim = input_dim
+        self.batch_size = batch_size
+        self.clip_gradient_norm = clip_gradient_norm
+        self.replay_memory = ReplayMemory(capacity=replay_capacity)
         self.memory = PPOMemory()
 
         self.policy = PolicyNet(self.num_actions, self.input_dim).to(device)
@@ -213,9 +269,8 @@ class PPOClip:
         action_logs = torch.cat([action_log_1, action_log_2], dim=1).to(device)
         entropies = torch.cat([action_dist_1.entropy().unsqueeze(1), action_dist_2.entropy().unsqueeze(1)], dim=1).to(
             device)
-        state_values = self.value(state)
 
-        return action_logs, entropies, state_values
+        return action_logs, entropies
 
     def decay_std(self):
         self.initial_std = max(self.std_min, self.std_coef * self.initial_std)
@@ -224,7 +279,6 @@ class PPOClip:
     def calc_GAE_V_tar(self, states, rewards, dones):
         with torch.no_grad():
             advantages = []
-            v_targets = []
             state_values = self.value(states)
             delta = deque()
             for i in range(len(rewards)):
@@ -238,34 +292,52 @@ class PPOClip:
             for i in range(len(rewards) - 1, -1, -1):
                 summation = self.discount_factor * self.lambda_r * summation + delta[i]
                 advantages.insert(0, summation)
-                v_targets.insert(0, summation + state_values[i].item())
 
-            return torch.as_tensor(advantages, dtype=torch.float32, device=device), torch.as_tensor(v_targets,
-                                                                                                    dtype=torch.float32,
-                                                                                                    device=device)
+            return torch.as_tensor(advantages, dtype=torch.float32, device=device)
 
-    def learn(self):
+    def learn_policy(self):
         states, actions, old_action_logs, rewards, next_states, dones = self.memory.return_samples()
-        advantages, v_targets = self.calc_GAE_V_tar(states, rewards, dones)
+        advantages = self.calc_GAE_V_tar(states, rewards, dones)
         advantages = advantages.unsqueeze(1)
-        v_targets = v_targets.unsqueeze(1)
         for _ in range(self.epochs):
-            action_logs, entropies, state_values = self.evaluate(states, actions)
+            action_logs, entropies = self.evaluate(states, actions)
             ratios = torch.exp(action_logs - old_action_logs)
             surrogate_1 = ratios * advantages
             surrogate_2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * advantages
             policy_loss = (- torch.min(surrogate_1, surrogate_2) - self.entropy_coef * entropies).mean()
-            value_loss = self.mse_loss(state_values, v_targets)
+
+            self.policy_running_loss += policy_loss.item()
+            self.policy_learned_count += 1
 
             self.p_optim.zero_grad()
             policy_loss.backward()
             self.p_optim.step()
 
-            self.c_optim.zero_grad()
-            value_loss.backward()
-            self.c_optim.step()
+        self.policy_loss_history.append(self.policy_running_loss / self.policy_learned_count)
+        self.policy_running_loss = 0
+        self.policy_learned_count = 0
 
-            self.loss_history.append(policy_loss.item() + value_loss.item())
+    def learn_v(self, done):
+        states, next_states, rewards, dones = self.replay_memory.sample(self.batch_size)
+        v_preds = self.value(states)
+        with torch.no_grad():
+            next_values = self.value(next_states)
+        next_values[dones] = 0
+        v_tar = rewards + self.discount_factor * next_values
+        loss = self.mse_loss(v_preds, v_tar)
+
+        self.value_running_loss += loss.item()
+        self.value_learned_count += 1
+
+        if done:
+            self.value_loss_history.append(self.value_running_loss / self.value_learned_count)
+            self.value_running_loss = 0
+            self.value_learned_count = 0
+
+        self.c_optim.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm(self.value.parameters(), self.clip_gradient_norm)
+        self.c_optim.step()
 
     def save(self, path):
         """
@@ -377,6 +449,9 @@ class Agent:
         self.lambda_r = hyperparams["lambda_r"]
         self.epochs = hyperparams["epochs"]
         self.epsilon = hyperparams["epsilon"]
+        self.replay_capacity = hyperparams["replay_capacity"]
+        self.batch_size = hyperparams["batch_size"]
+        self.clip_gradient_norm = hyperparams["clip_gradient_norm"]
         self.max_episodes = hyperparams["max_episodes"]
         self.render = hyperparams["render"]
         self.render_fps = hyperparams["render_fps"]
@@ -401,7 +476,10 @@ class Agent:
                                  self.actor_learning_rate,
                                  self.critic_learning_rate,
                                  self.env.action_space.shape[0],
-                                 self.env.observation_space.shape[0])
+                                 self.env.observation_space.shape[0],
+                                 self.replay_capacity,
+                                 self.batch_size,
+                                 self.clip_gradient_norm)
         else:
             pass  # PPO KL
 
@@ -410,8 +488,6 @@ class Agent:
         self.reward_history = []
         # Training loop over episodes
         for episode in range(1, self.max_episodes + 1):
-            if episode == 99:
-                a = 1
             state, _ = self.env.reset(seed=seed)
             done = False
             truncation = False
@@ -421,12 +497,17 @@ class Agent:
                 actions, action_logs = self.agent.select_action(state)
                 next_state, reward, done, truncation, _ = self.env.step(actions)
                 self.agent.memory.store(state, actions, action_logs, reward, next_state, (done or truncation))
+                self.agent.replay_memory.store(state, next_state, reward, done)
+
+                if len(self.agent.replay_memory) > self.batch_size:
+                    self.agent.learn_v(done or truncation)
+
                 state = next_state
                 episode_reward += reward
                 total_steps += 1
                 step_size += 1
 
-            self.agent.learn()
+            self.agent.learn_policy()
             self.agent.memory.delete_mem()
             self.agent.decay_std()
             self.reward_history.append(episode_reward)
@@ -442,8 +523,9 @@ class Agent:
                       f"Total Steps: {total_steps}, "
                       f"Ep Step: {step_size}, "
                       f"Raw Reward: {episode_reward:.2f}, "
-                      f"STD: {self.agent.initial_std: .2f} "
-                      f"Loss: {self.agent.loss_history[-1]:.2f}")
+                      f"STD: {self.agent.initial_std: .2f}, "
+                      f"Policy Loss: {self.agent.policy_loss_history[-1]:.2f}, "
+                      f"Value Loss: {self.agent.value_loss_history[-1]:.2f}")
 
             print(result)
         self.plot_training(episode)
@@ -508,18 +590,33 @@ class Agent:
 
         try:
             plt.figure()
-            plt.title("Network Loss")
-            plt.plot(self.agent.loss_history, label='Loss', color='#8921BB', alpha=1)
+            plt.title("Policy Loss")
+            plt.plot(self.agent.policy_loss_history, label='Loss', color='#8921BB', alpha=1)
             plt.xlabel("Episode")
             plt.ylabel("Loss")
             plt.tight_layout()
 
             # Only save as file if last episode
             if episode == self.max_episodes:
-                plt.savefig('./Loss_plot.png', format='png', dpi=600, bbox_inches='tight')
+                plt.savefig('./Policy_Loss_plot.png', format='png', dpi=600, bbox_inches='tight')
             plt.show()
         except Exception as e:
-            print(f'Error in loss:\n{e}')
+            print(f'Error in policy loss:\n{e}')
+
+        try:
+            plt.figure()
+            plt.title("Value Loss")
+            plt.plot(self.agent.value_loss_history, label='Loss', color='#8921BB', alpha=1)
+            plt.xlabel("Episode")
+            plt.ylabel("Loss")
+            plt.tight_layout()
+
+            # Only save as file if last episode
+            if episode == self.max_episodes:
+                plt.savefig('./Value_Loss_plot.png', format='png', dpi=600, bbox_inches='tight')
+            plt.show()
+        except Exception as e:
+            print(f'Error in value loss:\n{e}')
 
 
 if __name__ == "__main__":
@@ -527,7 +624,7 @@ if __name__ == "__main__":
     render = not train_mode
     RL_hyperparams = {
         "train_mode": train_mode,
-        "RL_load_path": './clip/final_weights' + '_' + '400' + '.pth',
+        "RL_load_path": './clip/final_weights' + '_' + '300' + '.pth',
         "save_path": './clip/final_weights',
         "save_interval": 100,
 
@@ -541,6 +638,9 @@ if __name__ == "__main__":
         "lambda_r": 0.95,
         "epsilon": 0.2,
         "epochs": 10,
+        "replay_capacity": 125_000,
+        "batch_size": 64,
+        "clip_gradient_norm": 5,
         "max_episodes": 1000 if train_mode else 2,
         "render": render,
 
