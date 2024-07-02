@@ -217,9 +217,9 @@ class PPOClip:
         self.value_loss_history = []
         self.value_running_loss = 0
         self.value_learned_count = 0
-        self.initial_std = initial_std
+        self.initial_std = torch.full((num_actions,), initial_std, dtype=torch.float32).to(device)
         self.std_coef = std_coef
-        self.std_min = std_min
+        self.std_min = torch.full((num_actions,), std_min, dtype=torch.float32).to(device)
         self.discount_factor = discount_factor
         self.lambda_r = lambda_r
         self.epochs = epochs
@@ -244,36 +244,29 @@ class PPOClip:
             state = torch.tensor(state, dtype=torch.float32, device=device)
 
         with torch.no_grad():
-            distributions = self.policy(state)
-            action_dist_1 = torch.distributions.Normal(distributions[0], self.initial_std)
-            action_dist_2 = torch.distributions.Normal(distributions[1], self.initial_std)
-            action_1 = action_dist_1.sample()
-            action_2 = action_dist_2.sample()
-            action_log_1 = action_dist_1.log_prob(action_1)
-            action_log_2 = action_dist_2.log_prob(action_2)
+            means = self.policy(state)
+            covariance_matrix = torch.diag(self.initial_std).unsqueeze(dim=0)
+            distribution = torch.distributions.MultivariateNormal(means, covariance_matrix)
+            action = distribution.sample()
+            action_log = distribution.log_prob(action)
 
-        return [action_1.item(), action_2.item()], [action_log_1.item(), action_log_2.item()]
+        return action.tolist()[0], action_log.item()
 
     def evaluate(self, state, action):
         if not torch.is_tensor(state):
             state = torch.as_tensor(state, dtype=torch.float32, device=device)
 
-        distributions = self.policy(state)
-        action_dist_1 = torch.distributions.Normal(distributions[:, 0], self.initial_std)
-        action_dist_2 = torch.distributions.Normal(distributions[:, 1], self.initial_std)
-        action_log_1 = action_dist_1.log_prob(action[:, 0])
-        action_log_2 = action_dist_2.log_prob(action[:, 1])
-        action_log_1 = action_log_1.unsqueeze(1)
-        action_log_2 = action_log_2.unsqueeze(1)
-
-        action_logs = torch.cat([action_log_1, action_log_2], dim=1).to(device)
-        entropies = torch.cat([action_dist_1.entropy().unsqueeze(1), action_dist_2.entropy().unsqueeze(1)], dim=1).to(
-            device)
+        means = self.policy(state)
+        stds = self.initial_std.expand_as(means)
+        covariance_matrices = torch.diag_embed(stds).to(device)
+        distributions = torch.distributions.MultivariateNormal(means, covariance_matrices)
+        action_logs = distributions.log_prob(action)
+        entropies = distributions.entropy()
 
         return action_logs, entropies
 
     def decay_std(self):
-        self.initial_std = max(self.std_min, self.std_coef * self.initial_std)
+        self.initial_std = torch.max(self.std_min, self.std_coef * self.initial_std)
         return self.initial_std
 
     def calc_GAE_V_tar(self, states, rewards, dones):
@@ -298,7 +291,7 @@ class PPOClip:
     def learn_policy(self):
         states, actions, old_action_logs, rewards, next_states, dones = self.memory.return_samples()
         advantages = self.calc_GAE_V_tar(states, rewards, dones)
-        advantages = advantages.unsqueeze(1)
+        # advantages = advantages.unsqueeze(1)
         for _ in range(self.epochs):
             action_logs, entropies = self.evaluate(states, actions)
             ratios = torch.exp(action_logs - old_action_logs)
@@ -458,7 +451,7 @@ class Agent:
         self.reward_history = None
 
         # Define Env
-        self.env = gym.make('Swimmer-v4', render_mode="human" if self.render else None)
+        self.env = gym.make('Swimmer-v4', render_mode="human" if self.render else None, max_episode_steps=1000 if self.render else 300)
         self.env.metadata['render_fps'] = self.render_fps  # For max frame rate make it 0
         warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -523,7 +516,7 @@ class Agent:
                       f"Total Steps: {total_steps}, "
                       f"Ep Step: {step_size}, "
                       f"Raw Reward: {episode_reward:.2f}, "
-                      f"STD: {self.agent.initial_std: .2f}, "
+                      f"STD: {self.agent.initial_std[0].item(): .2f}, "
                       f"Policy Loss: {self.agent.policy_loss_history[-1]:.2f}, "
                       f"Value Loss: {self.agent.value_loss_history[-1]:.2f}")
 
@@ -620,11 +613,11 @@ class Agent:
 
 
 if __name__ == "__main__":
-    train_mode = False
+    train_mode = True
     render = not train_mode
     RL_hyperparams = {
         "train_mode": train_mode,
-        "RL_load_path": './clip/final_weights' + '_' + '300' + '.pth',
+        "RL_load_path": './clip/final_weights' + '_' + '600' + '.pth',
         "save_path": './clip/final_weights',
         "save_interval": 100,
 
@@ -632,16 +625,16 @@ if __name__ == "__main__":
         "critic_learning_rate": 75e-5,
         "discount_factor": 0.99,
         "entropy_coef": 0.003,
-        "initial_std": 0.2 if train_mode else 0.01,
+        "initial_std": 0.3 if train_mode else 0.01,
         "std_min": 0.01,
-        "std_coef": 0.99,
+        "std_coef": 0.95,
         "lambda_r": 0.95,
         "epsilon": 0.2,
-        "epochs": 10,
+        "epochs": 300,
         "replay_capacity": 125_000,
         "batch_size": 64,
         "clip_gradient_norm": 5,
-        "max_episodes": 1000 if train_mode else 2,
+        "max_episodes": 2000 if train_mode else 2,
         "render": render,
 
         "clip_or_kl": True,
