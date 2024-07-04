@@ -87,13 +87,13 @@ class ReplayMemory:
 
 
 class PPOMemory:
-    def __init__(self):
-        self.states = deque()
-        self.actions = deque()
-        self.action_logs = deque()
-        self.rewards = deque()
-        self.next_states = deque()
-        self.dones = deque()
+    def __init__(self, capacity):
+        self.states = deque(maxlen=capacity)
+        self.actions = deque(maxlen=capacity)
+        self.action_logs = deque(maxlen=capacity)
+        self.rewards = deque(maxlen=capacity)
+        self.next_states = deque(maxlen=capacity)
+        self.dones = deque(maxlen=capacity)
 
     def store(self, state, action, action_log, reward, next_state, done):
         self.states.append(state)
@@ -120,17 +120,15 @@ class PPOMemory:
         return states, actions, action_logs, self.rewards, next_states, self.dones
 
     def delete_mem(self):
-        del self.states
-        del self.actions
-        del self.rewards
-        del self.next_states
-        del self.dones
+        self.states.clear()
+        self.actions.clear()
+        self.action_logs.clear()
+        self.rewards.clear()
+        self.next_states.clear()
+        self.dones.clear()
 
-        self.states = deque()
-        self.actions = deque()
-        self.rewards = deque()
-        self.next_states = deque()
-        self.dones = deque()
+    def __len__(self):
+        return len(self.dones)
 
 
 class PolicyNet(nn.Module):
@@ -231,7 +229,7 @@ class PPOClip:
         self.batch_size = batch_size
         self.clip_gradient_norm = clip_gradient_norm
         self.replay_memory = ReplayMemory(capacity=replay_capacity)
-        self.memory = PPOMemory()
+        self.memory = PPOMemory(capacity=replay_capacity)
 
         self.policy = PolicyNet(self.num_actions, self.input_dim).to(device)
         self.value = ValueNet(self.input_dim).to(device)
@@ -269,15 +267,19 @@ class PPOClip:
         self.initial_std = torch.max(self.std_min, self.std_coef * self.initial_std)
         return self.initial_std
 
-    def calc_GAE_V_tar(self, states, rewards, dones):
+    def calc_GAE_V_tar(self, states, next_state, rewards, dones):
         with torch.no_grad():
             advantages = []
             state_values = self.value(states)
+            next_state_value = self.value(next_state)
             delta = deque()
             for i in range(len(rewards)):
-                if not dones[i]:
+                if (not dones[i]) and (i < (len(rewards) - 1)):
                     delta.append(
                         rewards[i] + self.discount_factor * state_values[i + 1].item() - state_values[i].item())
+                elif (not dones[i]) and (i == (len(rewards) - 1)):
+                    delta.append(
+                        rewards[i] + self.discount_factor * next_state_value.item() - state_values[i].item())
                 else:
                     delta.append(rewards[i] - state_values[i].item())
 
@@ -288,9 +290,9 @@ class PPOClip:
 
             return torch.as_tensor(advantages, dtype=torch.float32, device=device)
 
-    def learn_policy(self):
+    def learn_policy(self, done):
         states, actions, old_action_logs, rewards, next_states, dones = self.memory.return_samples()
-        advantages = self.calc_GAE_V_tar(states, rewards, dones)
+        advantages = self.calc_GAE_V_tar(states, next_states[-1], rewards, dones)
         # advantages = advantages.unsqueeze(1)
         for _ in range(self.epochs):
             action_logs, entropies = self.evaluate(states, actions)
@@ -305,10 +307,10 @@ class PPOClip:
             self.p_optim.zero_grad()
             policy_loss.backward()
             self.p_optim.step()
-
-        self.policy_loss_history.append(self.policy_running_loss / self.policy_learned_count)
-        self.policy_running_loss = 0
-        self.policy_learned_count = 0
+        if done:
+            self.policy_loss_history.append(self.policy_running_loss / self.policy_learned_count)
+            self.policy_running_loss = 0
+            self.policy_learned_count = 0
 
     def learn_v(self, done):
         states, next_states, rewards, dones = self.replay_memory.sample(self.batch_size)
@@ -374,7 +376,7 @@ class StepWrapper(gym.Wrapper):
 
         modified_state = self.observation_wrapper.observation(state)
         # modified_reward = self.reward_wrapper.reward(modified_state)
-        return modified_state, reward, done, truncation, info
+        return state, reward, done, truncation, info
 
     def reset(self, seed):
         state, info = self.env.reset(seed=seed)  # Same as before as usual
@@ -388,14 +390,14 @@ class ObservationWrapper(gym.ObservationWrapper):
 
     def observation(self, state):  # state normalizer
         state = np.array(state)
-        state[0] = (state[0] + 50) / 100
-        state[1] = (state[1] + 50) / 100
-        state[2] = (state[2] + 50) / 100
-        state[3] = (state[3] + 50) / 100
-        state[4] = (state[4] + 50) / 100
-        state[5] = (state[5] + 50) / 100
-        state[6] = (state[6] + 50) / 100
-        state[7] = (state[7] + 50) / 100
+        state[0] = (state[0] + 5) / 10
+        state[1] = (state[1] + 5) / 10
+        state[2] = (state[2] + 5) / 10
+        state[3] = (state[3] + 5) / 10
+        state[4] = (state[4] + 5) / 10
+        state[5] = (state[5] + 5) / 10
+        state[6] = (state[6] + 5) / 10
+        state[7] = (state[7] + 5) / 10
 
         return state
 
@@ -451,7 +453,7 @@ class Agent:
         self.reward_history = None
 
         # Define Env
-        self.env = gym.make('Swimmer-v4', render_mode="human" if self.render else None, max_episode_steps=1000 if self.render else 300)
+        self.env = gym.make('Swimmer-v4', render_mode="human" if self.render else None)
         self.env.metadata['render_fps'] = self.render_fps  # For max frame rate make it 0
         warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -492,16 +494,16 @@ class Agent:
                 self.agent.memory.store(state, actions, action_logs, reward, next_state, (done or truncation))
                 self.agent.replay_memory.store(state, next_state, reward, done)
 
-                if len(self.agent.replay_memory) > self.batch_size:
+                if len(self.agent.memory) == self.batch_size or (done or truncation):
                     self.agent.learn_v(done or truncation)
+                    self.agent.learn_policy(done or truncation)
+                    self.agent.memory.delete_mem()
 
                 state = next_state
                 episode_reward += reward
                 total_steps += 1
                 step_size += 1
 
-            self.agent.learn_policy()
-            self.agent.memory.delete_mem()
             self.agent.decay_std()
             self.reward_history.append(episode_reward)
 
@@ -541,8 +543,11 @@ class Agent:
             episode_reward = 0
             reward = 0
             while not done and not truncation:
-                # print(f'y speed: {state[3]}, y pos: {state[1]}, reward : {reward}')
                 action, log_action = self.agent.select_action(state)
+                print('-----------------------------------------------------')
+                print(f'{state}')
+                print(f'{action}')
+                print('-----------------------------------------------------')
                 next_state, reward, done, truncation, _ = self.env.step(action)
                 state = next_state
                 episode_reward += reward
@@ -617,24 +622,24 @@ if __name__ == "__main__":
     render = not train_mode
     RL_hyperparams = {
         "train_mode": train_mode,
-        "RL_load_path": './clip/final_weights' + '_' + '600' + '.pth',
+        "RL_load_path": './clip/final_weights' + '_' + '1000' + '.pth',
         "save_path": './clip/final_weights',
         "save_interval": 100,
 
-        "actor_learning_rate": 75e-5,
-        "critic_learning_rate": 75e-5,
+        "actor_learning_rate": 3e-4,
+        "critic_learning_rate": 3e-4,
         "discount_factor": 0.99,
         "entropy_coef": 0.003,
-        "initial_std": 0.3 if train_mode else 0.01,
-        "std_min": 0.01,
-        "std_coef": 0.95,
+        "initial_std": 0.2 if train_mode else 0.001,
+        "std_min": 0.001,
+        "std_coef": 0.99,
         "lambda_r": 0.95,
         "epsilon": 0.2,
-        "epochs": 300,
+        "epochs": 10,
         "replay_capacity": 125_000,
         "batch_size": 64,
         "clip_gradient_norm": 5,
-        "max_episodes": 2000 if train_mode else 2,
+        "max_episodes": 1000 if train_mode else 2,
         "render": render,
 
         "clip_or_kl": True,
@@ -649,4 +654,4 @@ if __name__ == "__main__":
         DRL.train()
     else:
         # Test
-        DRL.test(2)
+        DRL.test(1)
