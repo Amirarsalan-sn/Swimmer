@@ -136,26 +136,26 @@ class PolicyNet(nn.Module):
         super(PolicyNet, self).__init__()
 
         self.FN = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 16),
-            nn.ReLU(inplace=True),
+            nn.Linear(input_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 128),
+            nn.Tanh(),
+            nn.Linear(128, 64),
+            nn.Tanh(),
         )
 
         self.mean = nn.Sequential(
-            nn.Linear(16, num_actions),
+            nn.Linear(64, num_actions),
             nn.Tanh()
         )
 
         self.std = nn.Sequential(
-            nn.Linear(16, num_actions),
-            nn.Softmax()
+            nn.Linear(64, num_actions),
+            nn.Sigmoid()
         )
 
         # He initialization.
-        for layer in [self.FN]:
+        """for layer in [self.FN]:
             for module in layer:
                 if isinstance(module, nn.Linear):
                     nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
@@ -163,7 +163,7 @@ class PolicyNet(nn.Module):
         for layer in [self.mean]:
             for module in layer:
                 if isinstance(module, nn.Linear):
-                    nn.init.kaiming_uniform_(module.weight, nonlinearity='tanh')
+                    nn.init.kaiming_uniform_(module.weight, nonlinearity='tanh')"""
 
         """for layer in [self.std]:
             for module in layer:
@@ -194,11 +194,6 @@ class ValueNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(64, 1)
         )
-        # He initialization.
-        for layer in [self.FN]:
-            for module in layer:
-                if isinstance(module, nn.Linear):
-                    nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
 
     def forward(self, x):
         return self.FN(x)
@@ -583,7 +578,7 @@ class Agent:
 
             # Only save as file if last episode
             if episode == self.max_episodes:
-                plt.savefig('./reward_plot.png', format='png', dpi=600, bbox_inches='tight')
+                plt.savefig('./reward_plot_256batch.png', format='png', dpi=600, bbox_inches='tight')
             plt.show()
         except Exception as e:
             print(f'Error in sma:\n{e}')
@@ -598,7 +593,7 @@ class Agent:
 
             # Only save as file if last episode
             if episode == self.max_episodes:
-                plt.savefig('./Policy_Loss_plot.png', format='png', dpi=600, bbox_inches='tight')
+                plt.savefig('./Policy_Loss_plot_256batch.png', format='png', dpi=600, bbox_inches='tight')
             plt.show()
         except Exception as e:
             print(f'Error in policy loss:\n{e}')
@@ -613,7 +608,7 @@ class Agent:
 
             # Only save as file if last episode
             if episode == self.max_episodes:
-                plt.savefig('./Value_Loss_plot.png', format='png', dpi=600, bbox_inches='tight')
+                plt.savefig('./Value_Loss_plot_256batch.png', format='png', dpi=600, bbox_inches='tight')
             plt.show()
         except Exception as e:
             print(f'Error in value loss:\n{e}')
@@ -624,8 +619,8 @@ if __name__ == "__main__":
     render = not train_mode
     RL_hyperparams = {
         "train_mode": train_mode,
-        "RL_load_path": './clip/final_weights' + '_' + '300' + '.pth',
-        "save_path": './clip/final_weights',
+        "RL_load_path": './clip/final_weights_256batch' + '_' + '2000' + '.pth',
+        "save_path": './clip/final_weights_256batch',
         "save_interval": 100,
 
         "actor_learning_rate": 3e-4,
@@ -639,9 +634,9 @@ if __name__ == "__main__":
         "epsilon": 0.2,
         "epochs": 10,
         "replay_capacity": 125_000,
-        "batch_size": 64,
+        "batch_size": 256,
         "clip_gradient_norm": 5,
-        "max_episodes": 1000 if train_mode else 2,
+        "max_episodes": 2000 if train_mode else 2,
         "render": render,
 
         "clip_or_kl": True,

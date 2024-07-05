@@ -141,26 +141,26 @@ class PolicyNet(nn.Module):
         super(PolicyNet, self).__init__()
 
         self.FN = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 16),
-            nn.ReLU(inplace=True),
+            nn.Linear(input_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 128),
+            nn.Tanh(),
+            nn.Linear(128, 64),
+            nn.Tanh(),
         )
 
         self.mean = nn.Sequential(
-            nn.Linear(16, num_actions),
+            nn.Linear(64, num_actions),
             nn.Tanh()
         )
 
         self.std = nn.Sequential(
-            nn.Linear(16, num_actions),
-            nn.Softmax()
+            nn.Linear(64, num_actions),
+            nn.Sigmoid()
         )
 
         # He initialization.
-        for layer in [self.FN]:
+        """for layer in [self.FN]:
             for module in layer:
                 if isinstance(module, nn.Linear):
                     nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
@@ -168,7 +168,7 @@ class PolicyNet(nn.Module):
         for layer in [self.mean]:
             for module in layer:
                 if isinstance(module, nn.Linear):
-                    nn.init.kaiming_uniform_(module.weight, nonlinearity='tanh')
+                    nn.init.kaiming_uniform_(module.weight, nonlinearity='tanh')"""
 
         """for layer in [self.std]:
             for module in layer:
@@ -212,7 +212,7 @@ class ValueNet(nn.Module):
 class PPOClip:
     def __init__(self, epsilon, discount_factor, lambda_r, epochs, entropy_coef, initial_std, std_coef, std_min,
                  actor_lr, critic_lr, num_actions, input_dim, replay_capacity, batch_size, clip_gradient_norm,
-                 clip_or_kl=True, kl_coef=0, target_kl = 0):
+                 clip_or_kl=True, kl_coef=0, target_kl=0):
         self.epsilon = epsilon
         self.policy_loss_history = []
         self.policy_running_loss = 0
@@ -228,7 +228,7 @@ class PPOClip:
         self.epochs = epochs
         self.entropy_coef = entropy_coef
         self.kl_coef = kl_coef
-        self.target_kl = 0
+        self.target_kl = target_kl
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
         self.num_actions = num_actions
@@ -323,8 +323,8 @@ class PPOClip:
 
     def learn_policy_clip(self, done):
         states, actions, old_action_logs, means_std, rewards, next_states, dones = self.memory.return_samples()
-        del means_std
         advantages = self.calc_GAE_V_tar(states, next_states[-1], rewards, dones)
+        del means_std
         # advantages = advantages.unsqueeze(1)
         for _ in range(self.epochs):
             action_logs, entropies = self.evaluate(states, actions)
@@ -349,7 +349,7 @@ class PPOClip:
         advantages = self.calc_GAE_V_tar(states, next_states[-1], rewards, dones)
         # advantages = advantages.unsqueeze(1)
         for _ in range(self.epochs):
-            action_logs, kl = self.evaluate(states, actions)
+            action_logs, kl = self.kl_divergence(states, actions, means_std)
             ratios = torch.exp(action_logs - old_action_logs)
             surrogate = ratios * advantages
             kl_divergence = self.kl_coef * kl
@@ -362,7 +362,7 @@ class PPOClip:
             self.p_optim.step()
 
             kl_mean = kl.mean()
-            if kl_mean < self.target_kl/1.5:
+            if kl_mean < self.target_kl / 1.5:
                 self.kl_coef /= 2
             elif kl_mean > self.target_kl * 1.5:
                 self.kl_coef *= 2
@@ -540,146 +540,144 @@ class Agent:
                              self.kl_coef,
                              self.target_kl)
 
+    def train(self):
+        total_steps = 0
+        self.reward_history = []
+        # Training loop over episodes
+        for episode in range(1, self.max_episodes + 1):
+            state, _ = self.env.reset(seed=seed)
+            done = False
+            truncation = False
+            step_size = 0
+            episode_reward = 0
+            while not done and not truncation:
+                actions, action_logs, mean_stds = self.agent.select_action(state)
+                next_state, reward, done, truncation, _ = self.env.step(actions)
+                self.agent.memory.store(state, actions, action_logs, mean_stds, reward, next_state,
+                                        (done or truncation))
+                self.agent.replay_memory.store(state, next_state, reward, done)
 
-def train(self):
-    total_steps = 0
-    self.reward_history = []
-    # Training loop over episodes
-    for episode in range(1, self.max_episodes + 1):
-        state, _ = self.env.reset(seed=seed)
-        done = False
-        truncation = False
-        step_size = 0
-        episode_reward = 0
-        while not done and not truncation:
-            actions, action_logs, mean_stds = self.agent.select_action(state)
-            next_state, reward, done, truncation, _ = self.env.step(actions)
-            self.agent.memory.store(state, actions, action_logs, mean_stds, reward, next_state, (done or truncation))
-            self.agent.replay_memory.store(state, next_state, reward, done)
+                if len(self.agent.memory) == self.batch_size or (done or truncation):
+                    self.agent.learn_v(done or truncation)
+                    self.agent.learn_policy(done or truncation)
+                    self.agent.memory.delete_mem()
 
-            if len(self.agent.memory) == self.batch_size or (done or truncation):
-                self.agent.learn_v(done or truncation)
-                self.agent.learn_policy(done or truncation)
-                self.agent.memory.delete_mem()
+                state = next_state
+                episode_reward += reward
+                total_steps += 1
+                step_size += 1
 
-            state = next_state
-            episode_reward += reward
-            total_steps += 1
-            step_size += 1
+            self.agent.decay_std()
+            self.reward_history.append(episode_reward)
 
-        self.agent.decay_std()
-        self.reward_history.append(episode_reward)
+            # -- based on interval
+            if episode % self.save_interval == 0:
+                self.agent.save(self.save_path + '_' + f'{episode}' + '.pth')
+                if episode != self.max_episodes:
+                    self.plot_training(episode)
+                print('\n~~~~~~Interval Save: Model saved.\n')
 
-        # -- based on interval
-        if episode % self.save_interval == 0:
-            self.agent.save(self.save_path + '_' + f'{episode}' + '.pth')
-            if episode != self.max_episodes:
-                self.plot_training(episode)
-            print('\n~~~~~~Interval Save: Model saved.\n')
+            result = (f"Episode: {episode}, "
+                      f"Total Steps: {total_steps}, "
+                      f"Ep Step: {step_size}, "
+                      f"Raw Reward: {episode_reward:.2f}, "
+                      f"STD: {self.agent.initial_std[0].item(): .2f}, "
+                      f"Policy Loss: {self.agent.policy_loss_history[-1]:.2f}, "
+                      f"Value Loss: {self.agent.value_loss_history[-1]:.2f}")
 
-        result = (f"Episode: {episode}, "
-                  f"Total Steps: {total_steps}, "
-                  f"Ep Step: {step_size}, "
-                  f"Raw Reward: {episode_reward:.2f}, "
-                  f"STD: {self.agent.initial_std[0].item(): .2f}, "
-                  f"Policy Loss: {self.agent.policy_loss_history[-1]:.2f}, "
-                  f"Value Loss: {self.agent.value_loss_history[-1]:.2f}")
+            print(result)
+        self.plot_training(episode)
 
-        print(result)
-    self.plot_training(episode)
+    def test(self, max_episodes):
+        """
+        Reinforcement learning policy evaluation.
+        """
 
+        # Load the weights of the test_network
+        self.agent.policy.load_state_dict(torch.load(self.RL_load_path))
+        self.agent.policy.eval()
 
-def test(self, max_episodes):
-    """
-    Reinforcement learning policy evaluation.
-    """
+        # Testing loop over episodes
+        for episode in range(1, max_episodes + 1):
+            state, _ = self.env.reset(seed=seed)
+            done = False
+            truncation = False
+            step_size = 0
+            episode_reward = 0
+            reward = 0
+            while not done and not truncation:
+                action, log_action = self.agent.select_action(state)
+                print('-----------------------------------------------------')
+                print(f'{state}')
+                print(f'{action}')
+                print('-----------------------------------------------------')
+                next_state, reward, done, truncation, _ = self.env.step(action)
+                state = next_state
+                episode_reward += reward
+                step_size += 1
 
-    # Load the weights of the test_network
-    self.agent.policy.load_state_dict(torch.load(self.RL_load_path))
-    self.agent.policy.eval()
+            # Print log
+            result = (f"Episode: {episode}, "
+                      f"Steps: {step_size:}, "
+                      f"Reward: {episode_reward:.2f}, ")
+            print(result)
 
-    # Testing loop over episodes
-    for episode in range(1, max_episodes + 1):
-        state, _ = self.env.reset(seed=seed)
-        done = False
-        truncation = False
-        step_size = 0
-        episode_reward = 0
-        reward = 0
-        while not done and not truncation:
-            action, log_action = self.agent.select_action(state)
-            print('-----------------------------------------------------')
-            print(f'{state}')
-            print(f'{action}')
-            print('-----------------------------------------------------')
-            next_state, reward, done, truncation, _ = self.env.step(action)
-            state = next_state
-            episode_reward += reward
-            step_size += 1
+        pygame.quit()  # close the rendering window
 
-        # Print log
-        result = (f"Episode: {episode}, "
-                  f"Steps: {step_size:}, "
-                  f"Reward: {episode_reward:.2f}, ")
-        print(result)
+    def plot_training(self, episode):
+        try:
+            # Calculate the Simple Moving Average (SMA) with a window size of 50
+            sma = np.convolve(self.reward_history, np.ones(50) / 50, mode='valid')
 
-    pygame.quit()  # close the rendering window
+            # Clip max (high) values for better plot analysis
+            reward_history = np.clip(self.reward_history, a_min=-100, a_max=100)
+            sma = np.clip(sma, a_min=None, a_max=100)
 
+            plt.figure()
+            plt.title("Obtained Rewards")
+            plt.plot(reward_history, label='Raw Reward', color='#4BA754', alpha=1)
+            plt.plot(sma, label='SMA 50', color='#F08100')
+            plt.xlabel("Episode")
+            plt.ylabel("Rewards")
+            plt.legend()
+            plt.tight_layout()
 
-def plot_training(self, episode):
-    try:
-        # Calculate the Simple Moving Average (SMA) with a window size of 50
-        sma = np.convolve(self.reward_history, np.ones(50) / 50, mode='valid')
+            # Only save as file if last episode
+            if episode == self.max_episodes:
+                plt.savefig('./images/reward_plot_kl.png', format='png', dpi=600, bbox_inches='tight')
+            plt.show()
+        except Exception as e:
+            print(f'Error in sma:\n{e}')
 
-        # Clip max (high) values for better plot analysis
-        reward_history = np.clip(self.reward_history, a_min=-100, a_max=100)
-        sma = np.clip(sma, a_min=None, a_max=100)
+        try:
+            plt.figure()
+            plt.title("Policy Loss")
+            plt.plot(self.agent.policy_loss_history, label='Loss', color='#8921BB', alpha=1)
+            plt.xlabel("Episode")
+            plt.ylabel("Loss")
+            plt.tight_layout()
 
-        plt.figure()
-        plt.title("Obtained Rewards")
-        plt.plot(reward_history, label='Raw Reward', color='#4BA754', alpha=1)
-        plt.plot(sma, label='SMA 50', color='#F08100')
-        plt.xlabel("Episode")
-        plt.ylabel("Rewards")
-        plt.legend()
-        plt.tight_layout()
+            # Only save as file if last episode
+            if episode == self.max_episodes:
+                plt.savefig('./images/Policy_Loss_plot_kl.png', format='png', dpi=600, bbox_inches='tight')
+            plt.show()
+        except Exception as e:
+            print(f'Error in policy loss:\n{e}')
 
-        # Only save as file if last episode
-        if episode == self.max_episodes:
-            plt.savefig('./reward_plot.png', format='png', dpi=600, bbox_inches='tight')
-        plt.show()
-    except Exception as e:
-        print(f'Error in sma:\n{e}')
+        try:
+            plt.figure()
+            plt.title("Value Loss")
+            plt.plot(self.agent.value_loss_history, label='Loss', color='#8921BB', alpha=1)
+            plt.xlabel("Episode")
+            plt.ylabel("Loss")
+            plt.tight_layout()
 
-    try:
-        plt.figure()
-        plt.title("Policy Loss")
-        plt.plot(self.agent.policy_loss_history, label='Loss', color='#8921BB', alpha=1)
-        plt.xlabel("Episode")
-        plt.ylabel("Loss")
-        plt.tight_layout()
-
-        # Only save as file if last episode
-        if episode == self.max_episodes:
-            plt.savefig('./Policy_Loss_plot.png', format='png', dpi=600, bbox_inches='tight')
-        plt.show()
-    except Exception as e:
-        print(f'Error in policy loss:\n{e}')
-
-    try:
-        plt.figure()
-        plt.title("Value Loss")
-        plt.plot(self.agent.value_loss_history, label='Loss', color='#8921BB', alpha=1)
-        plt.xlabel("Episode")
-        plt.ylabel("Loss")
-        plt.tight_layout()
-
-        # Only save as file if last episode
-        if episode == self.max_episodes:
-            plt.savefig('./Value_Loss_plot.png', format='png', dpi=600, bbox_inches='tight')
-        plt.show()
-    except Exception as e:
-        print(f'Error in value loss:\n{e}')
+            # Only save as file if last episode
+            if episode == self.max_episodes:
+                plt.savefig('./images/Value_Loss_plot_kl.png', format='png', dpi=600, bbox_inches='tight')
+            plt.show()
+        except Exception as e:
+            print(f'Error in value loss:\n{e}')
 
 
 if __name__ == "__main__":
@@ -687,8 +685,8 @@ if __name__ == "__main__":
     render = not train_mode
     RL_hyperparams = {
         "train_mode": train_mode,
-        "RL_load_path": './clip/final_weights' + '_' + '1000' + '.pth',
-        "save_path": './clip/final_weights',
+        "RL_load_path": './kl/final_weights' + '_' + '2000' + '.pth',
+        "save_path": './kl/final_weights',
         "save_interval": 100,
 
         "actor_learning_rate": 3e-4,
@@ -702,14 +700,14 @@ if __name__ == "__main__":
         "epsilon": 0.2,
         "epochs": 10,
         "replay_capacity": 125_000,
-        "kl_coef": 0.6,
+        "kl_coef": 0.5,
         "target_kl": 0.2,
         "batch_size": 64,
         "clip_gradient_norm": 5,
         "max_episodes": 1000 if train_mode else 2,
         "render": render,
 
-        "clip_or_kl": True,
+        "clip_or_kl": False,
 
         "render_fps": 60,
     }
