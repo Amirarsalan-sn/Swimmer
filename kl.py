@@ -606,7 +606,7 @@ class Agent:
             episode_reward = 0
             reward = 0
             while not done and not truncation:
-                action, log_action = self.agent.select_action(state)
+                action, log_action, mean_std = self.agent.select_action(state)
                 print('-----------------------------------------------------')
                 print(f'{state}')
                 print(f'{action}')
@@ -681,11 +681,11 @@ class Agent:
 
 
 if __name__ == "__main__":
-    train_mode = True
+    train_mode = False
     render = not train_mode
     RL_hyperparams = {
         "train_mode": train_mode,
-        "RL_load_path": './kl/final_weights' + '_' + '2000' + '.pth',
+        "RL_load_path": './kl/final_weights' + '_' + '100' + '.pth',
         "save_path": './kl/final_weights',
         "save_interval": 100,
 

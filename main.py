@@ -94,6 +94,8 @@ class PPOMemory:
         self.rewards = deque(maxlen=capacity)
         self.next_states = deque(maxlen=capacity)
         self.dones = deque(maxlen=capacity)
+        self.advantages = deque(maxlen=capacity)
+        self.starting_index = 0
 
     def store(self, state, action, action_log, reward, next_state, done):
         self.states.append(state)
@@ -103,21 +105,30 @@ class PPOMemory:
         self.next_states.append(next_state)
         self.dones.append(done)
 
-    def return_samples(self):
-        indices = [i for i in range(len(self.dones))]
+    def return_experience(self, batch_size):
+        indices = [i for i in range(self.starting_index, self.starting_index + batch_size)]
+        self.starting_index += batch_size
+        states = torch.stack([torch.as_tensor(self.states[i], dtype=torch.float32, device=device) for i in indices]).to(
+            device)
+        next_states = torch.stack(
+            [torch.as_tensor(self.next_states[i], dtype=torch.float32, device=device) for i in indices]).to(device)
+        rewards = [self.rewards[i] for i in indices]
+        dones = [self.dones[i] for i in indices]
+
+        return states, rewards, next_states, dones
+
+    def sample(self, batch_size):
+        indices = np.random.choice(len(self), size=batch_size, replace=False)
 
         states = torch.stack([torch.as_tensor(self.states[i], dtype=torch.float32, device=device) for i in indices]).to(
             device)
         actions = torch.stack(
             [torch.as_tensor(self.actions[i], dtype=torch.float32, device=device) for i in indices]).to(device)
+        advantages = torch.as_tensor([self.advantages[i] for i in indices], dtype=torch.float32, device=device)
         action_logs = torch.stack(
             [torch.as_tensor(self.action_logs[i], dtype=torch.float32, device=device) for i in indices]).to(device)
-        next_states = torch.stack(
-            [torch.as_tensor(self.next_states[i], dtype=torch.float32, device=device) for i in indices]).to(device)
-        # rewards = torch.as_tensor([self.rewards[i] for i in indices], dtype=torch.float32, device=device)
-        # dones = torch.as_tensor([self.dones[i] for i in indices], dtype=torch.bool, device=device)
 
-        return states, actions, action_logs, self.rewards, next_states, self.dones
+        return states, actions, advantages, action_logs
 
     def delete_mem(self):
         self.states.clear()
@@ -126,6 +137,11 @@ class PPOMemory:
         self.rewards.clear()
         self.next_states.clear()
         self.dones.clear()
+        self.advantages.clear()
+        self.starting_index = 0
+
+    def set_advantage(self, advantage):
+        self.advantages = advantage
 
     def __len__(self):
         return len(self.dones)
@@ -186,13 +202,13 @@ class ValueNet(nn.Module):
         super(ValueNet, self).__init__()
 
         self.FN = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
+            nn.Linear(256, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
 
     def forward(self, x):
@@ -201,12 +217,12 @@ class ValueNet(nn.Module):
 
 class PPOClip:
     def __init__(self, epsilon, discount_factor, lambda_r, epochs, entropy_coef, initial_std, std_coef, std_min,
-                 actor_lr, critic_lr, num_actions, input_dim, replay_capacity, batch_size, clip_gradient_norm):
+                 actor_lr, critic_lr, num_actions, input_dim, replay_capacity, batch_size, clip_gradient_norm, horizon):
         self.epsilon = epsilon
-        self.policy_loss_history = []
+        self.policy_loss_history = [0]
         self.policy_running_loss = 0
         self.policy_learned_count = 0
-        self.value_loss_history = []
+        self.value_loss_history = [0]
         self.value_running_loss = 0
         self.value_learned_count = 0
         self.initial_std = torch.full((num_actions,), initial_std, dtype=torch.float32).to(device)
@@ -223,7 +239,7 @@ class PPOClip:
         self.batch_size = batch_size
         self.clip_gradient_norm = clip_gradient_norm
         self.replay_memory = ReplayMemory(capacity=replay_capacity)
-        self.memory = PPOMemory(capacity=replay_capacity)
+        self.memory = PPOMemory(capacity=horizon)
 
         self.policy = PolicyNet(self.num_actions, self.input_dim).to(device)
         self.value = ValueNet(self.input_dim).to(device)
@@ -285,13 +301,11 @@ class PPOClip:
                 summation = self.discount_factor * self.lambda_r * summation + delta[i]
                 advantages.insert(0, summation)
 
-            return torch.as_tensor(advantages, dtype=torch.float32, device=device)
+            return advantages
 
     def learn_policy(self, done):
-        states, actions, old_action_logs, rewards, next_states, dones = self.memory.return_samples()
-        advantages = self.calc_GAE_V_tar(states, next_states[-1], rewards, dones)
-        # advantages = advantages.unsqueeze(1)
         for _ in range(self.epochs):
+            states, actions, advantages, old_action_logs = self.memory.sample(self.batch_size)
             action_logs, entropies = self.evaluate(states, actions)
             ratios = torch.exp(action_logs - old_action_logs)
             surrogate_1 = ratios * advantages
@@ -304,6 +318,7 @@ class PPOClip:
             self.p_optim.zero_grad()
             policy_loss.backward()
             self.p_optim.step()
+            self.learn_v(done)
         if done:
             self.policy_loss_history.append(self.policy_running_loss / self.policy_learned_count)
             self.policy_running_loss = 0
@@ -440,6 +455,7 @@ class Agent:
         self.clip_or_kl = hyperparams["clip_or_kl"]
         self.lambda_r = hyperparams["lambda_r"]
         self.epochs = hyperparams["epochs"]
+        self.horizon = hyperparams["horizon"]
         self.epsilon = hyperparams["epsilon"]
         self.replay_capacity = hyperparams["replay_capacity"]
         self.batch_size = hyperparams["batch_size"]
@@ -471,7 +487,8 @@ class Agent:
                                  self.env.observation_space.shape[0],
                                  self.replay_capacity,
                                  self.batch_size,
-                                 self.clip_gradient_norm)
+                                 self.clip_gradient_norm,
+                                 self.horizon)
         else:
             pass  # PPO KL
 
@@ -491,15 +508,19 @@ class Agent:
                 self.agent.memory.store(state, actions, action_logs, reward, next_state, (done or truncation))
                 self.agent.replay_memory.store(state, next_state, reward, done)
 
-                if len(self.agent.memory) == self.batch_size or (done or truncation):
-                    self.agent.learn_v(done or truncation)
-                    self.agent.learn_policy(done or truncation)
-                    self.agent.memory.delete_mem()
-
                 state = next_state
                 episode_reward += reward
                 total_steps += 1
                 step_size += 1
+
+                if done or truncation:
+                    states_exp, reward_exp, next_states_exp, dones_exp = self.agent.memory.return_experience(step_size)
+                    advantages = self.agent.calc_GAE_V_tar(states_exp, next_states_exp, reward_exp, dones_exp)
+                    self.agent.memory.advantages.extend(advantages)
+
+                if len(self.agent.memory) == self.horizon:
+                    self.agent.learn_policy(done or truncation)
+                    self.agent.memory.delete_mem()
 
             self.agent.decay_std()
             self.reward_history.append(episode_reward)
@@ -559,6 +580,8 @@ class Agent:
         pygame.quit()  # close the rendering window
 
     def plot_training(self, episode):
+        if episode != self.max_episodes:
+            return
         try:
             # Calculate the Simple Moving Average (SMA) with a window size of 50
             sma = np.convolve(self.reward_history, np.ones(50) / 50, mode='valid')
@@ -578,7 +601,7 @@ class Agent:
 
             # Only save as file if last episode
             if episode == self.max_episodes:
-                plt.savefig('./reward_plot_256batch.png', format='png', dpi=600, bbox_inches='tight')
+                plt.savefig('./images/clip/reward_plot_horizon_5000.png', format='png', dpi=600, bbox_inches='tight')
             plt.show()
         except Exception as e:
             print(f'Error in sma:\n{e}')
@@ -593,7 +616,7 @@ class Agent:
 
             # Only save as file if last episode
             if episode == self.max_episodes:
-                plt.savefig('./Policy_Loss_plot_256batch.png', format='png', dpi=600, bbox_inches='tight')
+                plt.savefig('./images/clip/Policy_Loss_plot_horizon_5000.png', format='png', dpi=600, bbox_inches='tight')
             plt.show()
         except Exception as e:
             print(f'Error in policy loss:\n{e}')
@@ -608,7 +631,7 @@ class Agent:
 
             # Only save as file if last episode
             if episode == self.max_episodes:
-                plt.savefig('./Value_Loss_plot_256batch.png', format='png', dpi=600, bbox_inches='tight')
+                plt.savefig('./images/clip/Value_Loss_plot_horizon_5000.png', format='png', dpi=600, bbox_inches='tight')
             plt.show()
         except Exception as e:
             print(f'Error in value loss:\n{e}')
@@ -619,24 +642,25 @@ if __name__ == "__main__":
     render = not train_mode
     RL_hyperparams = {
         "train_mode": train_mode,
-        "RL_load_path": './clip/final_weights_256batch' + '_' + '2000' + '.pth',
-        "save_path": './clip/final_weights_256batch',
+        "RL_load_path": './clip/final_weights_horizon_5000' + '_' + '4400' + '.pth',
+        "save_path": './clip/final_weights_horizon_5000',
         "save_interval": 100,
 
         "actor_learning_rate": 3e-4,
         "critic_learning_rate": 3e-4,
         "discount_factor": 0.99,
-        "entropy_coef": 0.003,
+        "entropy_coef": 0.05,
         "initial_std": 0.2 if train_mode else 0.001,
         "std_min": 0.001,
         "std_coef": 0.99,
         "lambda_r": 0.95,
+        "horizon": 2000,
         "epsilon": 0.2,
         "epochs": 10,
         "replay_capacity": 125_000,
-        "batch_size": 256,
+        "batch_size": 64,
         "clip_gradient_norm": 5,
-        "max_episodes": 2000 if train_mode else 2,
+        "max_episodes": 5000 if train_mode else 2,
         "render": render,
 
         "clip_or_kl": True,
